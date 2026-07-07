@@ -91,6 +91,12 @@ func DefaultNeverDowngrade(current, candidate Tier, loadBearing bool) bool {
 // Config is the runtime registry the consumer populates at startup. It is safe
 // for concurrent use by multiple goroutines — the request path across the
 // context fleet shares one *Config.
+//
+// A Config MUST be constructed with New(); the zero value is not usable. New()
+// initialises the internal maps and seeds the NeverDowngrade predicate, so a
+// zero-value Config{} (nil maps, nil predicate) will nil-deref on Register*
+// and panic on IsForbiddenDowngrade. This mirrors sync.Pool, bytes.Buffer's
+// method contract, and similar constructor-required types.
 type Config struct {
 	mu           sync.RWMutex
 	tiers        map[string]Tier
@@ -173,6 +179,12 @@ func (c *Config) RegisterAlternative(primary string, alts ...string) error {
 	for _, a := range c.alternatives[primary] {
 		seen[a] = struct{}{}
 	}
+	// Pre-validate every alternative and build the de-duplicated append list
+	// BEFORE mutating any state, so a later invalid element cannot leave a
+	// half-applied set. This matches RegisterTier's validate-before-mutate
+	// contract: on any invalid element the method returns the error with zero
+	// mutation (atomic all-or-nothing).
+	toAppend := make([]string, 0, len(alts))
 	for _, a := range alts {
 		if a == primary {
 			return fmt.Errorf("%w: %q", ErrSelfAlternative, primary)
@@ -184,8 +196,9 @@ func (c *Config) RegisterAlternative(primary string, alts ...string) error {
 			continue
 		}
 		seen[a] = struct{}{}
-		c.alternatives[primary] = append(c.alternatives[primary], a)
+		toAppend = append(toAppend, a)
 	}
+	c.alternatives[primary] = append(c.alternatives[primary], toAppend...)
 	return nil
 }
 

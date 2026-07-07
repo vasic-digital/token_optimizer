@@ -130,6 +130,46 @@ func TestRegisterAlternative(t *testing.T) {
 	}
 }
 
+// TestRegisterAlternativeAtomicOnInvalid proves RegisterAlternative is atomic:
+// when a later element in the same call is invalid, NO earlier valid element
+// may land (§11.4.1 no-half-applied-state, mirroring RegisterTier's
+// validate-before-mutate contract). The pre-fix code appended each valid alt
+// to the stored set BEFORE it could hit the invalid one and return the error,
+// leaving a partial set despite the failure. This test FAILED against that
+// buggy code and PASSES after the atomic pre-validate-then-append fix
+// (§11.4.115 RED→GREEN). Each sub-case uses a fresh Config so the "no partial
+// state landed" assertion is unambiguous.
+func TestRegisterAlternativeAtomicOnInvalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		alts    []string
+		wantErr error
+	}{
+		{"valid then unknown ghost", []string{"T-ALT1", "T-GHOST"}, ErrUnknownTier},
+		{"valid then self", []string{"T-ALT1", "T-PRIMARY"}, ErrSelfAlternative},
+		{"two valid then unknown", []string{"T-ALT1", "T-ALT2", "T-GHOST"}, ErrUnknownTier},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New()
+			for _, n := range []string{"T-PRIMARY", "T-ALT1", "T-ALT2"} {
+				if err := c.RegisterTier(Tier{Name: n}); err != nil {
+					t.Fatalf("register %q: %v", n, err)
+				}
+			}
+			err := c.RegisterAlternative("T-PRIMARY", tc.alts...)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("RegisterAlternative(%v) err = %v, want errors.Is %v", tc.alts, err, tc.wantErr)
+			}
+			// Atomic all-or-nothing: on error, NO earlier valid element may
+			// have been appended to the stored set.
+			if got := c.Alternatives("T-PRIMARY"); len(got) != 0 {
+				t.Fatalf("partial state landed despite error: Alternatives = %v, want empty (atomic all-or-nothing)", got)
+			}
+		})
+	}
+}
+
 func TestThresholds(t *testing.T) {
 	c := New()
 	if _, ok := c.Threshold("semantic_cosine_floor"); ok {
