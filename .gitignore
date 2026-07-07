@@ -1,0 +1,49 @@
+# --- Go build artifacts ---
+/bin/
+/build/
+/dist/
+/out/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.test
+*.out
+
+# --- Go tooling / cache ---
+/vendor/
+go.work
+go.work.sum
+
+# --- Coverage / profiling ---
+coverage.out
+coverage.txt
+*.prof
+htmlcov/
+
+# --- Secrets / sensitive (NEVER version) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+id_rsa*
+id_ed25519*
+.netrc
+secrets/
+
+# --- Temp / OS / IDE ---
+*.tmp
+*.swp
+*~
+*.orig
+*.rej
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.history/

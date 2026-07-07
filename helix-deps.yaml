@@ -1,0 +1,14 @@
+# §11.4.31 Submodule-Dependency-Manifest — own-org deps resolved from the parent
+# project ROOT (never nested own-org submodules; §11.4.28(C)).
+schema_version: 1
+deps:
+  - { name: TOON,        ssh_url: git@github.com:vasic-digital/TOON.git,           ref: main, why: WS7 wire-encode,               layout: flat }
+  - { name: Embeddings,  ssh_url: git@github.com:vasic-digital/Embeddings.git,     ref: main, why: WS6-L2 embed,                  layout: flat }
+  - { name: VectorDB,    ssh_url: git@github.com:vasic-digital/VectorDB.git,       ref: main, why: WS6-L2 ANN store,              layout: flat }
+  - { name: Normalize,   ssh_url: git@github.com:vasic-digital/Normalize.git,      ref: main, why: request canonicalization,      layout: flat }
+  - { name: LLMProvider, ssh_url: git@github.com:HelixDevelopment/LLMProvider.git, ref: main, why: transport-tier provider iface, layout: flat }
+  - { name: conversation, ssh_url: git@github.com:vasic-digital/conversation.git,  ref: main, why: infinite-context compression,  layout: flat }
+transitive_handling:
+  recursive: true
+  conflict_resolution: operator-required
+language_specific_subtree: false
