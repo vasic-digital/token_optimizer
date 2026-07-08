@@ -56,9 +56,12 @@ func newOptimizer(t *testing.T, c *config.Config) *Optimizer {
 }
 
 // req is a small helper to build a pipeline.Request from the embedded
-// router.Request fields.
+// router.Request fields. It leaves the evidence-correlation fields
+// (TaskClass/Tokens/Cost — see evidence_wiring_test.go) at their zero value:
+// every test using this helper never installs an evidence Recorder, so those
+// fields have no observable effect (§11.4.69 opt-in instrumentation).
 func req(min, floor string, loadBearing bool) Request {
-	return Request{router.Request{MinTier: min, FloorTier: floor, LoadBearing: loadBearing}}
+	return Request{Request: router.Request{MinTier: min, FloorTier: floor, LoadBearing: loadBearing}}
 }
 
 // liveExcept returns a liveness predicate reporting every tier live except the

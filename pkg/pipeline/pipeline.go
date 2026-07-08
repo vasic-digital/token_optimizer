@@ -54,8 +54,32 @@ var (
 // same decoupled MinTier / FloorTier / LoadBearing signals drive both selection
 // and floor-preserving failover; the pipeline introduces no new routing
 // vocabulary of its own.
+//
+// TaskClass, Tokens, and Cost are the evidence-correlation fields
+// router.EvidenceMeta needs whenever an evidence Recorder is installed via
+// SetEvidenceRecorder (see evidence emission below). They mirror
+// router.EvidenceMeta's own decoupling contract exactly (§11.4.28): opaque to
+// this package, consumer-supplied, never inferred, re-derived, or fabricated
+// from LoadBearing, MinTier, or any other field (§11.4.6). A caller that never
+// installs a Recorder may leave them at their zero value with zero effect on
+// routing — Optimize's decision logic never reads them.
 type Request struct {
 	router.Request
+
+	// TaskClass is the consumer's own task-classification label (e.g.
+	// "verdict", "code_small"), forwarded verbatim into the emitted
+	// evidence record's task_class field.
+	TaskClass string
+	// Tokens is the consumer-supplied total token count for the turn this
+	// request routes, forwarded verbatim into the emitted evidence record's
+	// tokens field. The pipeline counts nothing itself — token accounting is
+	// pkg/telemetry's job (WS1).
+	Tokens int64
+	// Cost is the consumer-supplied USD cost for the turn, from the
+	// consumer's own price table, forwarded verbatim into the emitted
+	// evidence record's "$" field. The pipeline never computes or guesses a
+	// cost.
+	Cost float64
 }
 
 // Optimizer is the engine's single request-path entry point. It is constructed
@@ -80,6 +104,25 @@ func New(cfg *config.Config) (*Optimizer, error) {
 	return &Optimizer{cfg: cfg, router: r}, nil
 }
 
+// SetEvidenceRecorder installs rec as this Optimizer's routing-evidence sink:
+// every subsequent Optimize call additionally emits one router.Evidence JSONL
+// record for the underlying router.Select decision, via the exact
+// nil-safe/no-behavior-change-when-unset contract router.Router's own
+// SetEvidenceRecorder provides (pkg/router/evidence.go). Passing nil disables
+// emission.
+//
+// The pipeline never constructs its own Recorder, its own Evidence type, or
+// its own emission path — it delegates entirely to the *router.Router it
+// already composes, so the WS5 DESIGN.md §4 item 3 anti-bluff guarantee
+// ("every decide() appends a JSONL line ... a PASS without this line is a
+// §11.4 bluff") closes at exactly the layer that calls router.Select: Optimize
+// itself, the engine's actual single request-path entry point (§11.4.124 —
+// evidence.go's Recorder/Evidence were a correct, unit-tested, but
+// UNREACHABLE standalone library from here before this wiring existed).
+func (o *Optimizer) SetEvidenceRecorder(rec *router.Recorder) {
+	o.router.SetEvidenceRecorder(rec)
+}
+
 // Optimize resolves the tier a request will actually be sent to. It first
 // selects the cheapest adequate tier while honoring the never-downgrade floor
 // (router.Select). If that tier is live it is used directly. If it is down the
@@ -99,7 +142,25 @@ func (o *Optimizer) Optimize(req Request, live func(name string) bool) (Decision
 		return Decision{}, ErrNilLiveness
 	}
 
-	sel, err := o.router.Select(req.Request)
+	// SelectWithEvidence's decision LOGIC is byte-for-byte identical to bare
+	// Select's in every configuration (see pkg/router/evidence.go's own
+	// no-behavior-change-when-unset contract) — this call adds nothing to and
+	// removes nothing from tier selection. The only behavioural difference is
+	// OPT-IN: when a Recorder is installed via SetEvidenceRecorder, this call
+	// additionally emits ONE router.Evidence JSONL record built from meta's
+	// three consumer-supplied correlation fields (ReqHash from req.ID —
+	// already-real request data, never invented here — plus req.TaskClass /
+	// req.Tokens / req.Cost, forwarded verbatim per §11.4.6/§11.4.28). meta is
+	// used unconditionally: constructing it is free (four field reads) and
+	// SelectWithEvidence itself is the nil-recorder no-op path when no
+	// Recorder was ever installed.
+	meta := router.EvidenceMeta{
+		ReqHash:   req.ID,
+		TaskClass: req.TaskClass,
+		Tokens:    req.Tokens,
+		Cost:      req.Cost,
+	}
+	sel, err := o.router.SelectWithEvidence(req.Request, meta)
 	if err != nil {
 		return Decision{}, err
 	}
