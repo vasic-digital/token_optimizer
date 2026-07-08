@@ -1,7 +1,7 @@
 # token_optimizer
 
-**Revision:** 1
-**Last modified:** 2026-07-08T00:00:00Z
+**Revision:** 2
+**Last modified:** 2026-07-08T07:18:45Z
 **Status:** active
 **Description:** Project-agnostic Go engine that minimizes the token / cost / byte
 footprint of LLM request pipelines — tier routing with a never-downgrade floor,
