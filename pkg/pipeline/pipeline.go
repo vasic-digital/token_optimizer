@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/vasic-digital/token_optimizer/pkg/cache"
 	"github.com/vasic-digital/token_optimizer/pkg/config"
 	"github.com/vasic-digital/token_optimizer/pkg/router"
 )
@@ -88,6 +89,15 @@ type Request struct {
 type Optimizer struct {
 	cfg    *config.Config
 	router *router.Router
+
+	// cache is the OPTIONAL WS6 response cache installed via SetCache
+	// (cache.go). It is nil unless the consumer explicitly installs one, and
+	// plain Optimize NEVER reads it — installing (or not installing) a cache
+	// has zero effect on Optimize itself. Only OptimizeCached consults it. See
+	// cache.go for the full design rationale (why the cache-first
+	// short-circuit lives in a separate composing method rather than inside
+	// Optimize's own body).
+	cache *cache.Cache
 }
 
 // New returns an Optimizer bound to cfg. It returns ErrNilConfig if cfg is nil,
