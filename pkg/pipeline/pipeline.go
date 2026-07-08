@@ -27,10 +27,12 @@ package pipeline
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/vasic-digital/token_optimizer/pkg/cache"
 	"github.com/vasic-digital/token_optimizer/pkg/config"
 	"github.com/vasic-digital/token_optimizer/pkg/router"
+	"github.com/vasic-digital/token_optimizer/pkg/telemetry"
 )
 
 // Pipeline errors are sentinel values so callers classify failures with
@@ -79,8 +81,44 @@ type Request struct {
 	// Cost is the consumer-supplied USD cost for the turn, from the
 	// consumer's own price table, forwarded verbatim into the emitted
 	// evidence record's "$" field. The pipeline never computes or guesses a
-	// cost.
+	// cost. It ALSO doubles, unmodified, as the WS1 savings wiring's
+	// telemetry.SavingsRecord.OptimizedCost (see SetSavingsRecorder below) —
+	// it already documents itself as exactly "what the request ACTUALLY
+	// cost", the same quantity SavingsRecord.OptimizedCost requires.
 	Cost float64
+
+	// BaselineCost is the WS1 savings-accounting counterpart to Cost: the
+	// consumer-supplied USD cost this EXACT request would have incurred on
+	// the project's un-optimized baseline path (e.g. the native / heaviest
+	// tier the router would have used with no optimizer present), computed
+	// by the consumer's own price table — typically via
+	// telemetry.ComputeCost against a pkg/config.Tier the consumer considers
+	// its baseline. Forwarded verbatim into the emitted
+	// telemetry.SavingsRecord.BaselineCost field (see SetSavingsRecorder).
+	//
+	// Decoupling (§11.4.28) + honesty (§11.4.6): this field exists because
+	// NEITHER router.Decision NOR pipeline.Decision expose a "baseline tier"
+	// this package could itself resolve a price from — Optimize only ever
+	// returns the tier it actually chose, never "the tier that would have
+	// been used absent optimization". Rather than GUESS a baseline (e.g. by
+	// assuming the strongest registered tier is always the pre-optimizer
+	// default, which is a project-specific policy this decoupled engine has
+	// no basis to assume — see pkg/config's own "ships ZERO project
+	// constants" contract), this package asks the caller for the baseline
+	// cost directly, exactly mirroring Cost's own established
+	// caller-supplied-opaque-data contract. A zero value is emitted
+	// verbatim (an honest "no baseline reported"), never a fabricated
+	// number.
+	BaselineCost float64
+
+	// At is the consumer-supplied event timestamp, forwarded verbatim into
+	// the emitted telemetry.SavingsRecord.At field. This package never
+	// reads a wall clock of its own for savings accounting — At is passed
+	// in so aggregation stays deterministic (§11.4.50), mirroring
+	// telemetry.Record.At's and telemetry.SavingsRecord.At's own documented
+	// contract exactly: a zero At is emitted verbatim, never substituted
+	// with time.Now().
+	At time.Time
 }
 
 // Optimizer is the engine's single request-path entry point. It is constructed
@@ -98,6 +136,14 @@ type Optimizer struct {
 	// short-circuit lives in a separate composing method rather than inside
 	// Optimize's own body).
 	cache *cache.Cache
+
+	// savings is the OPTIONAL WS1 $-savings sink installed via
+	// SetSavingsRecorder. It is nil unless the consumer explicitly installs
+	// one; every Optimize / OptimizeCached call behaves IDENTICALLY to
+	// before this field existed when it is unset — the exact nil-safe,
+	// no-behavior-change-when-unset contract cache and evidence already
+	// established (see SetCache / SetEvidenceRecorder).
+	savings *telemetry.SavingsRecorder
 }
 
 // New returns an Optimizer bound to cfg. It returns ErrNilConfig if cfg is nil,
@@ -131,6 +177,60 @@ func New(cfg *config.Config) (*Optimizer, error) {
 // UNREACHABLE standalone library from here before this wiring existed).
 func (o *Optimizer) SetEvidenceRecorder(rec *router.Recorder) {
 	o.router.SetEvidenceRecorder(rec)
+}
+
+// SetSavingsRecorder installs rec as this Optimizer's WS1 $-savings sink:
+// every subsequent Optimize call that produces a Decision (either directly
+// selected or floor-preserving-failed-over) additionally emits ONE
+// telemetry.SavingsRecord built from REAL data — the tier the request was
+// FINALLY sent to (Decision.Tier.Name, what actually happened, never the
+// pre-failover entitlement) plus the caller-measured Request.BaselineCost /
+// Request.Cost / Request.At (see their doc comments above for the exact
+// decoupling contract each one carries). Passing nil disables emission.
+//
+// This closes the EXACT §11.4.124 "correct but unreachable" gap
+// pkg/telemetry/savings.go's own WS1 R.37 review flagged: ComputeCost,
+// SavingsRecord, and SavingsRecorder were a correct, unit-tested, but
+// STANDALONE library before this wiring existed — nothing in this engine's
+// actual decision path (Optimize, the single request-path entry point real
+// consumers call) ever constructed or recorded a SavingsRecord. SetCache and
+// SetEvidenceRecorder are the established precedent for exactly this pattern
+// (an optional sink an Optimizer composes without owning); this method adds
+// the third.
+//
+// Installing a SavingsRecorder never changes Optimize's ROUTING behavior —
+// the returned Decision is byte-for-byte identical in every configuration
+// (see TestOptimize_NoSavingsRecorderInstalled_NilSafeNoEmit) — it only
+// additionally records the $-savings evidence for the decision that was
+// already made.
+func (o *Optimizer) SetSavingsRecorder(rec *telemetry.SavingsRecorder) {
+	o.savings = rec
+}
+
+// recordSavings emits ONE telemetry.SavingsRecord for a just-produced,
+// successful Decision when a SavingsRecorder is installed. It is a pure
+// no-op (nil, nil) when o.savings is unset — the nil-safe,
+// no-behavior-change-when-unset contract every optional sink on this
+// Optimizer shares. tag is the tier the request was FINALLY billed against
+// (the caller passes Decision.Tier.Name, never SelectedTier — the $ ledger
+// must reflect what actually happened, not the pre-failover entitlement).
+//
+// A Record failure (e.g. ErrNegativeCost from a caller price-table bug, or a
+// sink I/O error) is returned to the caller rather than silently swallowed —
+// matching SelectWithEvidence's own established precedent for the WS5
+// evidence-emission failure case (§11.4.6: a fabricated PASS while quietly
+// losing the $-savings trail is the exact bluff this wiring exists to
+// prevent).
+func (o *Optimizer) recordSavings(req Request, tag string) error {
+	if o.savings == nil {
+		return nil
+	}
+	return o.savings.Record(telemetry.SavingsRecord{
+		Tag:           tag,
+		BaselineCost:  req.BaselineCost,
+		OptimizedCost: req.Cost,
+		At:            req.At,
+	})
 }
 
 // Optimize resolves the tier a request will actually be sent to. It first
@@ -178,14 +278,18 @@ func (o *Optimizer) Optimize(req Request, live func(name string) bool) (Decision
 	// Selected tier is live: use it directly. Its floor was already honored by
 	// router.Select, so no re-application is needed here.
 	if live(sel.Tier.Name) {
-		return Decision{
+		d := Decision{
 			Tier:         sel.Tier,
 			SelectedTier: sel.Tier,
 			Reason:       ReasonSelected,
 			LoadBearing:  req.LoadBearing,
 			Floored:      sel.Floored,
 			FailedOver:   false,
-		}, nil
+		}
+		if err := o.recordSavings(req, d.Tier.Name); err != nil {
+			return d, fmt.Errorf("pipeline: emit savings record: %w", err)
+		}
+		return d, nil
 	}
 
 	// Selected tier is down. Fail over WHILE PRESERVING THE FLOOR: the selected
@@ -209,14 +313,18 @@ func (o *Optimizer) Optimize(req Request, live func(name string) bool) (Decision
 		if !live(altName) {
 			continue
 		}
-		return Decision{
+		d := Decision{
 			Tier:         altTier,
 			SelectedTier: sel.Tier,
 			Reason:       ReasonFailoverPreservedFloor,
 			LoadBearing:  req.LoadBearing,
 			Floored:      sel.Floored,
 			FailedOver:   true,
-		}, nil
+		}
+		if err := o.recordSavings(req, d.Tier.Name); err != nil {
+			return d, fmt.Errorf("pipeline: emit savings record: %w", err)
+		}
+		return d, nil
 	}
 
 	// The selected tier is down and no live alternative satisfies the floor:

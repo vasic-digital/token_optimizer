@@ -52,9 +52,11 @@ package pipeline
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/vasic-digital/token_optimizer/pkg/cache"
+	"github.com/vasic-digital/token_optimizer/pkg/telemetry"
 )
 
 // ErrNilExecute is returned by OptimizeCached when handed a nil execute
@@ -141,6 +143,13 @@ func (o *Optimizer) OptimizeCached(cacheKey string, req Request, live func(strin
 	computed := false
 	v, err := o.cache.GetOrCompute(cacheKey, func() (string, time.Duration, error) {
 		computed = true
+		// On a MISS, Optimize runs for real — including this Optimizer's own
+		// WS1 savings wiring (pipeline.go's recordSavings), which already
+		// emits the routing-decision SavingsRecord for this call. Recording
+		// AGAIN here would double-count a single real decision; per the
+		// "COMPOSES config and router; duplicates neither" philosophy this
+		// whole package follows, the miss path's savings accounting is
+		// Optimize's job alone.
 		d, oErr := o.Optimize(req, live)
 		if oErr != nil {
 			return "", 0, oErr
@@ -155,5 +164,29 @@ func (o *Optimizer) OptimizeCached(cacheKey string, req Request, live func(strin
 	if err != nil {
 		return "", computedDecision, false, err
 	}
-	return v, computedDecision, !computed, nil
+	hit := !computed
+
+	// A real cache HIT (or this call losing an in-flight single-flight race
+	// to a concurrent identical request — GetOrCompute's own documented
+	// contract treats both as "downstream compute was not run for this
+	// call") means routing NEVER ran for this call, so Optimize's own wiring
+	// above never fired. This IS the "cache hit -> full baseline cost
+	// avoided" case pkg/telemetry/savings.go's own SavingsRecord.OptimizedCost
+	// doc names explicitly ("Zero means the full baseline cost was avoided
+	// (e.g. a cache hit)"): OptimizedCost is exactly 0 (no tier was ever
+	// invoked for this call) and BaselineCost is the caller-supplied
+	// Request.BaselineCost this task's own decoupling contract already
+	// established — the SAME field Optimize's routing-path wiring consumes,
+	// never re-derived or guessed here.
+	if hit && o.savings != nil {
+		if recErr := o.savings.Record(telemetry.SavingsRecord{
+			Tag:           "cache_hit",
+			BaselineCost:  req.BaselineCost,
+			OptimizedCost: 0,
+			At:            req.At,
+		}); recErr != nil {
+			return v, computedDecision, hit, fmt.Errorf("pipeline: emit cache-hit savings record: %w", recErr)
+		}
+	}
+	return v, computedDecision, hit, nil
 }
