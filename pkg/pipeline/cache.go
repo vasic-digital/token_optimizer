@@ -186,13 +186,19 @@ func (o *Optimizer) OptimizeCached(cacheKey string, req Request, live func(strin
 		// resolveBaselineCost applies the IDENTICAL AutoBaseline contract as
 		// Optimize's own recordSavings — a cache hit must ALSO self-compute
 		// when asked, never silently keep the caller-supplied req.BaselineCost
-		// as a stale fallback (§11.4.6).
+		// as a stale fallback (§11.4.6). InputTokens/OutputTokens are
+		// forwarded VERBATIM below, mirroring recordSavings' own WS1
+		// data-completeness fix (pipeline.go) — a cache hit must ALSO record
+		// the request's real measured per-channel counts, never leave them at
+		// their Go zero value while Optimize's routing-path wiring does not.
 		baseline, bErr := o.resolveBaselineCost(req)
 		if bErr != nil {
 			return v, computedDecision, hit, fmt.Errorf("pipeline: resolve auto-computed baseline for cache-hit savings record: %w", bErr)
 		}
 		if recErr := o.savings.Record(telemetry.SavingsRecord{
 			Tag:           "cache_hit",
+			InputTokens:   req.InputTokens,
+			OutputTokens:  req.OutputTokens,
 			BaselineCost:  baseline,
 			OptimizedCost: 0,
 			At:            req.At,

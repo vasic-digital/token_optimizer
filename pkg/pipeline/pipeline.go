@@ -165,19 +165,27 @@ type Request struct {
 	AutoBaseline bool
 
 	// InputTokens / OutputTokens are the caller's own REAL measured
-	// per-channel token counts for this exact request/turn, consulted ONLY
-	// when AutoBaseline is true. They exist because telemetry.ComputeCost
-	// prices input and output tokens SEPARATELY, and this Request's
-	// pre-existing Tokens field is a single COMBINED total that cannot be
-	// split into input/output without guessing a ratio — forbidden by
-	// §11.4.6 (see savings_wiring_test.go's own "THE HONEST FINDING"
-	// comment, which first recorded this exact constraint). These two
-	// fields never guess a split: they carry whatever real per-channel
-	// counts the caller already measured, exactly mirroring
-	// telemetry.SavingsRecord's own pre-existing (until now unwired)
-	// InputTokens/OutputTokens fields. Zero value with AutoBaseline=false
-	// has no effect whatsoever, matching Tokens'/Cost's own opt-in,
-	// zero-value-is-inert contract.
+	// per-channel token counts for this exact request/turn. They exist
+	// because telemetry.ComputeCost prices input and output tokens
+	// SEPARATELY, and this Request's pre-existing Tokens field is a single
+	// COMBINED total that cannot be split into input/output without
+	// guessing a ratio — forbidden by §11.4.6 (see savings_wiring_test.go's
+	// own "THE HONEST FINDING" comment, which first recorded this exact
+	// constraint). These two fields never guess a split: they carry
+	// whatever real per-channel counts the caller already measured.
+	//
+	// Consulted for AutoBaseline's self-derived BaselineCost when
+	// AutoBaseline is true (with zero effect whatsoever when false, matching
+	// Tokens'/Cost's own opt-in, zero-value-is-inert contract for THAT
+	// purpose) — AND, independently of AutoBaseline, forwarded VERBATIM into
+	// every emitted telemetry.SavingsRecord.InputTokens/OutputTokens (see
+	// recordSavings below + cache.go's cache-hit branch), closing the data-
+	// completeness gap SavingsRecord's own pre-existing (until now unwired)
+	// InputTokens/OutputTokens fields left open: the emitted forensic
+	// record now always carries the request's real measured counts (zero
+	// when the caller never measured any — an honest zero, never
+	// fabricated), whether or not the caller also opted into AutoBaseline
+	// pricing.
 	InputTokens  int64
 	OutputTokens int64
 }
@@ -276,6 +284,13 @@ func (o *Optimizer) SetSavingsRecorder(rec *telemetry.SavingsRecorder) {
 // (the caller passes Decision.Tier.Name, never SelectedTier — the $ ledger
 // must reflect what actually happened, not the pre-failover entitlement).
 //
+// InputTokens/OutputTokens are forwarded VERBATIM from req into the emitted
+// record (never derived, never re-split from the combined Tokens field,
+// §11.4.6) — closing the WS1 data-completeness gap the R.37 review flagged:
+// SavingsRecord.InputTokens/OutputTokens existed but were left at their Go
+// zero value by every construction site until this wiring. A request that
+// never measured any tokens honestly records zero; it is never fabricated.
+//
 // A Record failure (e.g. ErrNegativeCost from a caller price-table bug, or a
 // sink I/O error) is returned to the caller rather than silently swallowed —
 // matching SelectWithEvidence's own established precedent for the WS5
@@ -292,6 +307,8 @@ func (o *Optimizer) recordSavings(req Request, tag string) error {
 	}
 	return o.savings.Record(telemetry.SavingsRecord{
 		Tag:           tag,
+		InputTokens:   req.InputTokens,
+		OutputTokens:  req.OutputTokens,
 		BaselineCost:  baseline,
 		OptimizedCost: req.Cost,
 		At:            req.At,
