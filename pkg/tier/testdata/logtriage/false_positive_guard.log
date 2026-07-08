@@ -1,0 +1,9 @@
+CM-NO-FAIL-OPEN-SKIP: gate about fail-open policy... [1;32mPASS[0m
+CM-NO-SKIP-FAIL-OPEN: another fail-open-named gate... [1;32mPASS[0m
+CM-WARN-BUDGET-CHECK: gate whose own name contains WARN but reports PASS... [1;32mPASS[0m
+CM-REAL-WARN: this one truly warns... [1;33mWARN[0m (real warning reason)
+ALL MANDATORY CHECKS PASSED
+Total tests: 4
+Passed: 4
+Failed: 0
+Warnings: 1

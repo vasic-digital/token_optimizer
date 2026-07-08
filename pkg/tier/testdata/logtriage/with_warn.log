@@ -1,0 +1,8 @@
+CM-A: desc A... [1;32mPASS[0m
+CM-WARN-1: desc B... [1;33mWARN[0m (some reason one)
+CM-WARN-2: desc C... [1;33mWARN[0m (30/44 propagated - fleet cascade in flight)
+ALL MANDATORY CHECKS PASSED
+Total tests: 3
+Passed: 3
+Failed: 0
+Warnings: 2

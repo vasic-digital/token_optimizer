@@ -1,0 +1,6 @@
+CM-A: desc A... [1;32mPASS[0m
+CM-FAIL-1: desc B... [1;31mFAIL[0m (root cause: missing config)
+Total tests: 2
+Passed: 1
+Failed: 1
+Warnings: 0
