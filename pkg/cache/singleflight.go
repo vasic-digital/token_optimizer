@@ -98,12 +98,13 @@ func (c *Cache) GetOrCompute(key string, compute ComputeFunc) (string, error) {
 	c.sf[key] = call
 	c.sfMu.Unlock()
 
-	// Snapshot the invalidation marker BEFORE compute runs (winner-only path).
-	c.mu.Lock()
-	genBefore, hadTomb := c.tombstones[key]
-	c.mu.Unlock()
-
-	value, ttl, err := compute()
+	// computeGuarded runs the WS6 cross-process guard (crossprocess.go) when
+	// one is configured, then either way arrives at the tombstone-snapshot +
+	// compute + write-back sequence via runComputeAndWriteBack. With no
+	// CrossProcessLock configured (c.xlock == nil, the default) this is
+	// EXACTLY the original in-process-only sequence — see
+	// runComputeAndWriteBack for the unchanged logic.
+	value, err := c.computeGuarded(key, compute)
 
 	if err != nil {
 		call.err = err
@@ -121,6 +122,79 @@ func (c *Cache) GetOrCompute(key string, compute ComputeFunc) (string, error) {
 		return "", err
 	}
 
+	call.value = value
+	close(call.done)
+
+	// See the error-path comment above: the slot is released only now, after
+	// the result is both cached (when not superseded) and broadcast via
+	// done, so no window exists in which a concurrent caller could observe
+	// neither an in-flight call nor a cached value for this key.
+	c.sfMu.Lock()
+	delete(c.sf, key)
+	c.sfMu.Unlock()
+
+	return value, nil
+}
+
+// computeGuarded runs compute for the in-process single-flight winner,
+// optionally coordinated with a cross-process lock (WithCrossProcessLock).
+//
+// With no CrossProcessLock configured, this immediately delegates to
+// runComputeAndWriteBack — the original, unmodified in-process-only
+// behaviour.
+//
+// With a CrossProcessLock configured, it first tries to become the
+// cross-process winner too:
+//   - Lock acquired (ok): this process is BOTH the in-process AND the
+//     cross-process winner. It runs runComputeAndWriteBack normally (which
+//     writes the result to the shared Store) and releases the cross-process
+//     lock afterward, regardless of outcome (defer).
+//   - Lock not acquired, OR the lock backend itself errored (ok == false):
+//     another process is very likely already computing this key. Rather
+//     than compute redundantly, this process waits (pollForResult) for that
+//     winner to publish its result to the shared Store. If a result shows up
+//     within the wait budget, it is returned WITHOUT ever calling compute —
+//     the cross-process single-flight success case. If nothing shows up in
+//     time (winner still running, no shared Store configured, or the
+//     winner's process died mid-computation), this process falls back to
+//     computing directly via runComputeAndWriteBack. This fallback is the
+//     honest degrade path required when no shared Store makes the winner's
+//     result observable (§11.4.6): the guard can only ever REDUCE redundant
+//     computation, it never risks a hang or a fabricated result.
+func (c *Cache) computeGuarded(key string, compute ComputeFunc) (string, error) {
+	if c.xlock == nil {
+		return c.runComputeAndWriteBack(key, compute)
+	}
+
+	unlock, ok, lockErr := c.xlock.TryLock(key)
+	if lockErr == nil && ok {
+		defer func() { _ = unlock() }()
+		return c.runComputeAndWriteBack(key, compute)
+	}
+
+	if v, found := c.pollForResult(key); found {
+		return v, nil
+	}
+	return c.runComputeAndWriteBack(key, compute)
+}
+
+// runComputeAndWriteBack is the tombstone-snapshot + compute + write-back
+// sequence GetOrCompute has always run for its in-process winner, extracted
+// unchanged so computeGuarded can wrap it with the optional cross-process
+// guard above. See GetOrCompute's doc comment for the full correctness
+// argument (in particular the "Correctness under a concurrent Invalidate"
+// section) — nothing about that argument changes here.
+func (c *Cache) runComputeAndWriteBack(key string, compute ComputeFunc) (string, error) {
+	// Snapshot the invalidation marker BEFORE compute runs.
+	c.mu.Lock()
+	genBefore, hadTomb := c.tombstones[key]
+	c.mu.Unlock()
+
+	value, ttl, err := compute()
+	if err != nil {
+		return "", err
+	}
+
 	c.mu.Lock()
 	genNow, hasTombNow := c.tombstones[key]
 	c.mu.Unlock()
@@ -135,16 +209,48 @@ func (c *Cache) GetOrCompute(key string, compute ComputeFunc) (string, error) {
 		_ = c.SetWithTTL(key, value, ttl)
 	}
 
-	call.value = value
-	close(call.done)
-
-	// See the error-path comment above: the slot is released only now, after
-	// the result is both cached (when not superseded) and broadcast via
-	// done, so no window exists in which a concurrent caller could observe
-	// neither an in-flight call nor a cached value for this key.
-	c.sfMu.Lock()
-	delete(c.sf, key)
-	c.sfMu.Unlock()
-
 	return value, nil
+}
+
+// pollForResult waits for a cross-process winner to publish key's result to
+// the shared Store, polling c.Get (which checks L1 then the injected Store)
+// at c.xpoll intervals for up to c.xtimeout, falling back to the package
+// defaults for either bound left at its zero value. It returns found == true
+// the moment a servable value appears; found == false once the wait budget
+// elapses with none.
+//
+// This deliberately uses REAL wall-clock time (time.Now/time.Sleep), NOT
+// c.clock() — c.clock() exists so TTL/invalidation decisions (a pure
+// function of stored timestamps) are deterministic under an injected fake
+// clock (§11.4.50). Waiting for a genuinely concurrent, externally-owned
+// OTHER PROCESS to finish is not such a decision: no fake clock can make an
+// external process finish sooner, so using c.clock() here would either (a)
+// do nothing useful in production (time.Now IS c.clock() there) or (b), far
+// worse, spin forever in any test that injects a fixed/fake clock — the
+// fake time never advances, the deadline is never reached, and a follower
+// that never finds a result loops until the test's own timeout kills it.
+// That exact bug was caught live by this package's own test suite (an
+// earlier draft used c.clock() here and hung the whole `go test`
+// invocation) — the authoritative reason this function is pinned to real
+// time regardless of what Clock the Cache was constructed with.
+func (c *Cache) pollForResult(key string) (string, bool) {
+	poll := c.xpoll
+	if poll <= 0 {
+		poll = defaultCrossProcessPoll
+	}
+	timeout := c.xtimeout
+	if timeout <= 0 {
+		timeout = defaultCrossProcessTimeout
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		if v, hit, err := c.Get(key); err == nil && hit {
+			return v, true
+		}
+		if !time.Now().Before(deadline) {
+			return "", false
+		}
+		time.Sleep(poll)
+	}
 }

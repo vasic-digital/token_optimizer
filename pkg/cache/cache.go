@@ -29,6 +29,18 @@
 // Invalidate that lands mid-computation is honoured (the computed result is
 // answered to the in-flight caller but never written back), never resurrected
 // as a stale hit. See docs/research/tokens/ws6_caching_sync/DESIGN.md §1/§4.
+//
+// Cross-process synchronization (WS6 follow-up — crossprocess.go): the
+// single-flight registry above coalesces callers WITHIN one process. When
+// multiple OS processes share the same injected Store (e.g. this project's
+// own multi-track fleet, each process an independent Go runtime), an
+// OPTIONAL CrossProcessLock — installed via WithCrossProcessLock — extends
+// the same guarantee across processes: at most one process actively computes
+// a given key at a time, and a process that loses that race waits for the
+// winner's result to appear in the shared Store before falling back to
+// computing itself. See crossprocess.go's CrossProcessLock doc comment and
+// filelock_unix.go for the flock-based reference implementation the WS6
+// design specifies.
 package cache
 
 import (
@@ -195,6 +207,17 @@ type Cache struct {
 	// discipline documented on mu above.
 	sfMu sync.Mutex
 	sf   map[string]*sfCall
+
+	// xlock, xpoll, xtimeout configure the OPTIONAL cross-process extension of
+	// the single-flight guard (crossprocess.go). xlock is nil unless
+	// WithCrossProcessLock is used, in which case GetOrCompute's in-process
+	// winner additionally contends for a cross-process lock before computing;
+	// xpoll/xtimeout bound how long a cross-process loser waits for the winner's
+	// result before falling back to computing itself (see computeGuarded in
+	// singleflight.go). Both zero means "use the package defaults".
+	xlock    CrossProcessLock
+	xpoll    time.Duration
+	xtimeout time.Duration
 }
 
 // New returns a ready Cache configured by opts. With no WithStore option it is a
