@@ -174,14 +174,26 @@ func (o *Optimizer) OptimizeCached(cacheKey string, req Request, live func(strin
 	// avoided" case pkg/telemetry/savings.go's own SavingsRecord.OptimizedCost
 	// doc names explicitly ("Zero means the full baseline cost was avoided
 	// (e.g. a cache hit)"): OptimizedCost is exactly 0 (no tier was ever
-	// invoked for this call) and BaselineCost is the caller-supplied
-	// Request.BaselineCost this task's own decoupling contract already
-	// established — the SAME field Optimize's routing-path wiring consumes,
-	// never re-derived or guessed here.
+	// invoked for this call) and BaselineCost is resolved via
+	// resolveBaselineCost — the caller-supplied Request.BaselineCost this
+	// task's own decoupling contract originally established, UNLESS
+	// Request.AutoBaseline is set, in which case it is self-computed from
+	// the strongest registered tier (see pipeline.go's Request.AutoBaseline
+	// doc comment). Either way it is the SAME resolution Optimize's own
+	// routing-path wiring (recordSavings) applies — never re-derived or
+	// guessed differently here.
 	if hit && o.savings != nil {
+		// resolveBaselineCost applies the IDENTICAL AutoBaseline contract as
+		// Optimize's own recordSavings — a cache hit must ALSO self-compute
+		// when asked, never silently keep the caller-supplied req.BaselineCost
+		// as a stale fallback (§11.4.6).
+		baseline, bErr := o.resolveBaselineCost(req)
+		if bErr != nil {
+			return v, computedDecision, hit, fmt.Errorf("pipeline: resolve auto-computed baseline for cache-hit savings record: %w", bErr)
+		}
 		if recErr := o.savings.Record(telemetry.SavingsRecord{
 			Tag:           "cache_hit",
-			BaselineCost:  req.BaselineCost,
+			BaselineCost:  baseline,
 			OptimizedCost: 0,
 			At:            req.At,
 		}); recErr != nil {

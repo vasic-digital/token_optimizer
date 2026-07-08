@@ -51,6 +51,18 @@ var (
 	// pipeline refuses a weaker-than-floor alternative rather than quietly
 	// violating the never-downgrade guarantee (§11.4.6).
 	ErrNoFloorSafeLiveTier = errors.New("pipeline: no live alternative satisfies the never-downgrade floor")
+	// ErrNoBaselineTier is returned when Request.AutoBaseline is true but the
+	// Optimizer's config has ZERO registered tiers to resolve a baseline price
+	// from. An honest failure (§11.4.6): the pipeline never silently falls
+	// back to the caller-supplied BaselineCost (which may be a deliberate "no
+	// baseline reported" zero, see BaselineCost's own doc comment) nor
+	// fabricates a baseline number when there is no tier to price one
+	// against. In practice this is only reachable via OptimizeCached's
+	// cache-hit path against an Optimizer whose config never had any tier
+	// registered — Optimize's own routing path can never reach it, because
+	// router.Select itself already fails with router.ErrNoTiers before any
+	// savings accounting runs whenever zero tiers are registered.
+	ErrNoBaselineTier = errors.New("pipeline: no registered tier to resolve an auto-computed baseline from")
 )
 
 // Request is the pipeline's request signal set. It embeds router.Request so the
@@ -119,6 +131,55 @@ type Request struct {
 	// contract exactly: a zero At is emitted verbatim, never substituted
 	// with time.Now().
 	At time.Time
+
+	// AutoBaseline is the WS1 follow-up (ATM-660 continuation) closing the
+	// limitation BaselineCost's own doc comment recorded: when true, the
+	// pipeline SELF-COMPUTES the emitted SavingsRecord.BaselineCost instead
+	// of requiring the caller to supply it, by resolving the STRONGEST
+	// registered tier from the Optimizer's *config.Config — tiers[len-1] in
+	// the cheapest-first ordering config.Tiers() returns (Priority
+	// ascending, ties on Name) — and pricing InputTokens/OutputTokens
+	// against it via telemetry.ComputeCost.
+	//
+	// This is NOT a newly invented, project-specific assumption (§11.4.6):
+	// "the strongest registered tier" is the IDENTICAL definition
+	// pkg/router/loadbearing.go's resolveFloor already uses for a
+	// load-bearing request's implicit never-downgrade floor (absent an
+	// explicit FloorTier), and BaselineCost's own doc comment already names
+	// "the native / heaviest tier the router would have used with no
+	// optimizer present" as exactly what an un-optimized baseline path
+	// means — the same quantity, resolved the same way, in one
+	// already-established engine-owned place.
+	//
+	// When false (the zero value — the default), this field has ZERO
+	// effect: BaselineCost is forwarded verbatim exactly as it was before
+	// this field existed (nil-safe / additive, no behavior change when
+	// unused). When true, the self-computed value REPLACES BaselineCost for
+	// the SavingsRecord this call emits — BaselineCost itself is ignored
+	// for that call, never consulted as a secondary fallback (one
+	// deterministic source of truth per call, §11.4.50).
+	//
+	// Self-computation requires at least one tier registered on the
+	// Optimizer's config; see ErrNoBaselineTier for the honest failure mode
+	// when none is.
+	AutoBaseline bool
+
+	// InputTokens / OutputTokens are the caller's own REAL measured
+	// per-channel token counts for this exact request/turn, consulted ONLY
+	// when AutoBaseline is true. They exist because telemetry.ComputeCost
+	// prices input and output tokens SEPARATELY, and this Request's
+	// pre-existing Tokens field is a single COMBINED total that cannot be
+	// split into input/output without guessing a ratio — forbidden by
+	// §11.4.6 (see savings_wiring_test.go's own "THE HONEST FINDING"
+	// comment, which first recorded this exact constraint). These two
+	// fields never guess a split: they carry whatever real per-channel
+	// counts the caller already measured, exactly mirroring
+	// telemetry.SavingsRecord's own pre-existing (until now unwired)
+	// InputTokens/OutputTokens fields. Zero value with AutoBaseline=false
+	// has no effect whatsoever, matching Tokens'/Cost's own opt-in,
+	// zero-value-is-inert contract.
+	InputTokens  int64
+	OutputTokens int64
 }
 
 // Optimizer is the engine's single request-path entry point. It is constructed
@@ -225,12 +286,40 @@ func (o *Optimizer) recordSavings(req Request, tag string) error {
 	if o.savings == nil {
 		return nil
 	}
+	baseline, err := o.resolveBaselineCost(req)
+	if err != nil {
+		return err
+	}
 	return o.savings.Record(telemetry.SavingsRecord{
 		Tag:           tag,
-		BaselineCost:  req.BaselineCost,
+		BaselineCost:  baseline,
 		OptimizedCost: req.Cost,
 		At:            req.At,
 	})
+}
+
+// resolveBaselineCost returns the $ figure this Request's emitted
+// SavingsRecord.BaselineCost should carry: req.BaselineCost UNCHANGED when
+// req.AutoBaseline is false (the pre-existing, unmodified contract — nil-safe
+// / zero behavior change when unused, §11.4.6), or a value SELF-COMPUTED from
+// the strongest registered tier when req.AutoBaseline is true. See
+// Request.AutoBaseline's doc comment for the full rationale (why "the
+// strongest tier" is not a guess, and why InputTokens/OutputTokens exist
+// instead of reusing the combined Tokens field).
+//
+// It returns ErrNoBaselineTier when AutoBaseline is true but the config has
+// no registered tiers — an honest failure rather than a silent fallback to
+// req.BaselineCost or a fabricated zero.
+func (o *Optimizer) resolveBaselineCost(req Request) (float64, error) {
+	if !req.AutoBaseline {
+		return req.BaselineCost, nil
+	}
+	tiers := o.cfg.Tiers() // cheapest-first, deterministic (Priority asc, then Name)
+	if len(tiers) == 0 {
+		return 0, ErrNoBaselineTier
+	}
+	strongest := tiers[len(tiers)-1]
+	return telemetry.ComputeCost(req.InputTokens, req.OutputTokens, strongest.PricePerMTokIn, strongest.PricePerMTokOut), nil
 }
 
 // Optimize resolves the tier a request will actually be sent to. It first
