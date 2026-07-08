@@ -80,6 +80,20 @@ func (c *Cache) GetOrCompute(key string, compute ComputeFunc) (string, error) {
 		<-call.done
 		return call.value, call.err
 	}
+	// Double-check the cache under sfMu before registering as the winner. The
+	// fast-path c.Get above runs WITHOUT sfMu, so a single-flight winner can
+	// cache the value AND release its slot in the window between this caller's
+	// Get-miss and its acquiring sfMu here. Without this re-check, such a
+	// late-arriving caller finds no in-flight call, registers a second slot,
+	// and starts a SECOND redundant compute for a value that is already
+	// cached — the exact stampede this primitive exists to prevent. (A -race
+	// -count=20 stress reproduces the double-compute; -count=3 missed it —
+	// §11.4.50 deterministic-consistency.) Lock order is consistently
+	// sfMu→c.mu here; no path takes c.mu then sfMu, so this cannot deadlock.
+	if v, hit, gerr := c.Get(key); gerr == nil && hit {
+		c.sfMu.Unlock()
+		return v, nil
+	}
 	call := &sfCall{done: make(chan struct{})}
 	c.sf[key] = call
 	c.sfMu.Unlock()
