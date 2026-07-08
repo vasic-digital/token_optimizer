@@ -35,6 +35,9 @@ func (c *Cache) Invalidate(key string) error {
 	c.mu.Lock()
 	delete(c.l1, key)
 	c.tombstones[key] = now
+	// Bound the tombstone map when a retention TTL is configured (no-op by
+	// default); tombstones are born here, so this is where growth is capped.
+	c.pruneTombstonesLocked(now)
 	c.mu.Unlock()
 
 	if c.store != nil {

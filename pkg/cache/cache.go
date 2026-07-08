@@ -94,6 +94,29 @@ func WithDefaultTTL(d time.Duration) Option {
 	return func(c *Cache) { c.defaultTTL = d }
 }
 
+// WithTombstoneTTL bounds how long an invalidation tombstone is retained, so the
+// tombstone map cannot grow without bound for keys that are invalidated and never
+// re-Set (a superseding Set already clears a key's tombstone regardless of this
+// option). A non-positive duration (the default) retains tombstones indefinitely,
+// which preserves the no-stale-serve guarantee unconditionally.
+//
+// SAFETY CONTRACT. A tombstone at instant T rejects any value written at or
+// before T (validLocked's StoredAt-after-tombstone test); pruning it removes that
+// protection. Pruning is therefore only safe once no such value can still be
+// served. The remaining safety net after a tombstone is pruned is the entry's own
+// TTL: a value written at or before T with a positive TTL is rejected on ExpiresAt
+// grounds alone once it expires. So a consumer that enables this option MUST set d
+// to at least the maximum lifetime a value can have in its L2 store (the longest
+// per-entry TTL plus any eventual-consistency / delete-propagation lag). Under
+// that contract every value a pruned tombstone would have rejected is itself
+// already TTL-expired, so no stale value is ever served. A consumer that stores
+// values with no TTL (never-expiring entries) in a leaky or eventually-consistent
+// store MUST NOT enable this option — for such a store no finite retention is
+// provably safe, and the default (retain forever) is the correct choice.
+func WithTombstoneTTL(d time.Duration) Option {
+	return func(c *Cache) { c.tombstoneTTL = d }
+}
+
 // entry is one cached value plus the metadata the cache reasons over. StoredAt
 // is when the value was written (compared against a key's tombstone so an
 // invalidation is honoured even if the value physically survives in L2).
@@ -147,6 +170,16 @@ type Cache struct {
 	store      Store
 	clock      Clock
 	defaultTTL time.Duration
+
+	// tombstoneTTL bounds how long an invalidation tombstone is retained. Zero
+	// (the default) retains tombstones until a superseding Set clears them, which
+	// preserves the no-stale-serve guarantee unconditionally but lets the map grow
+	// for keys that are invalidated and never re-Set. A positive value lets an old
+	// tombstone be pruned so the map stays bounded; see WithTombstoneTTL for the
+	// consumer contract that keeps pruning safe. lastPrune throttles the sweep to
+	// at most once per tombstoneTTL window so it stays amortised O(1).
+	tombstoneTTL time.Duration
+	lastPrune    time.Time
 }
 
 // New returns a ready Cache configured by opts. With no WithStore option it is a
@@ -174,6 +207,25 @@ func (c *Cache) validLocked(key string, e entry, now time.Time) bool {
 		return false // stored at or before the last invalidation: tombstoned
 	}
 	return true
+}
+
+// pruneTombstonesLocked drops tombstones older than tombstoneTTL, bounding the
+// map for keys that are invalidated and never re-Set. It is a no-op when the
+// option is off (tombstoneTTL <= 0) and is throttled to run at most once per
+// tombstoneTTL window so it stays amortised O(1) even on a hot Invalidate path.
+// Safety of the prune is the WithTombstoneTTL consumer contract. Must be called
+// with c.mu held.
+func (c *Cache) pruneTombstonesLocked(now time.Time) {
+	if c.tombstoneTTL <= 0 || now.Sub(c.lastPrune) < c.tombstoneTTL {
+		return
+	}
+	c.lastPrune = now
+	cutoff := now.Add(-c.tombstoneTTL)
+	for k, tomb := range c.tombstones {
+		if tomb.Before(cutoff) {
+			delete(c.tombstones, k)
+		}
+	}
 }
 
 // Get returns the cached value for key and whether it was a hit. It consults L1
@@ -215,11 +267,27 @@ func (c *Cache) Get(key string) (value string, hit bool, err error) {
 		return "", false, fmt.Errorf("cache: L2 decode %q: %w", key, dErr)
 	}
 
+	// Re-read the clock before the promotion decision: the store call may have
+	// blocked on I/O, and an entry that TTL-expired DURING that call must be judged
+	// against the clock now, not the clock at Get entry (§11.4.6 — never serve an
+	// entry that is already expired at the moment we decide to serve it).
+	now = c.clock()
+
 	// Re-validate AND promote under the lock: a tombstone or fresh Set may have
 	// landed while the store call was in flight, so the decision is made against
 	// current state, never the state at read time.
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Freshness guard (CACHE-IMP-1): a concurrent Set may have promoted a strictly
+	// newer value into L1 while our L2 read was in flight. Never resurrect the
+	// older L2-read entry over it — that would serve the stale value until the
+	// next TTL/invalidate. When a newer-or-equal, still-servable L1 entry is
+	// present, keep it and serve it; do NOT overwrite L1 with the older read.
+	if cur, ok := c.l1[key]; ok && !e.StoredAt.After(cur.StoredAt) && c.validLocked(key, cur, now) {
+		return cur.Value, true, nil
+	}
+
 	if !c.validLocked(key, e, now) {
 		return "", false, nil // stale/expired/tombstoned L2 value: never served
 	}
