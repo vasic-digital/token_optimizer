@@ -22,6 +22,13 @@
 // eventually-consistent backend, or a concurrent writer that re-inserted a stale
 // value) is still not served. This mirrors the WS6 caching-POC L1 TTL / L3
 // no-stale-serve intent.
+//
+// Synchronization (WS6 "single-flight" — singleflight.go): GetOrCompute is the
+// stampede guard for a hot key missed by N concurrent callers at once — one
+// caller computes, the rest wait and share its result, and a concurrent
+// Invalidate that lands mid-computation is honoured (the computed result is
+// answered to the in-flight caller but never written back), never resurrected
+// as a stale hit. See docs/research/tokens/ws6_caching_sync/DESIGN.md §1/§4.
 package cache
 
 import (
@@ -180,6 +187,14 @@ type Cache struct {
 	// at most once per tombstoneTTL window so it stays amortised O(1).
 	tombstoneTTL time.Duration
 	lastPrune    time.Time
+
+	// sfMu guards sf, the WS6 single-flight registry (see singleflight.go). It is
+	// a SEPARATE lock from mu: sf tracks in-flight GetOrCompute calls whose
+	// compute function may block for a long time (network/tool I/O), and mu must
+	// never be held across such a call — the same no-blocking-under-the-data-lock
+	// discipline documented on mu above.
+	sfMu sync.Mutex
+	sf   map[string]*sfCall
 }
 
 // New returns a ready Cache configured by opts. With no WithStore option it is a
@@ -189,6 +204,7 @@ func New(opts ...Option) *Cache {
 		l1:         make(map[string]entry),
 		tombstones: make(map[string]time.Time),
 		clock:      time.Now,
+		sf:         make(map[string]*sfCall),
 	}
 	for _, opt := range opts {
 		opt(c)
