@@ -89,6 +89,11 @@ type Decision struct {
 // Router selects tiers over a consumer-populated *config.Config.
 type Router struct {
 	cfg *config.Config
+	// evidence is the optional routing-evidence sink SelectWithEvidence
+	// writes to (evidence.go). It is nil by default: a Router constructed by
+	// New never emits evidence and behaves exactly as it did before evidence
+	// wiring existed. See SetEvidenceRecorder + SelectWithEvidence.
+	evidence *Recorder
 }
 
 // New returns a Router bound to cfg. It returns ErrNilConfig if cfg is nil so a
